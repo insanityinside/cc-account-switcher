@@ -6,7 +6,7 @@ A simple command-line tool to manage and switch between multiple Claude Code acc
 
 - **One-command switching**: Single command to switch between OAuth and API accounts
 - **Same-email account support**: Manage multiple accounts that share the same email address (e.g. personal and work accounts on a single email)
-- **Auto-labelling**: Accounts are automatically labelled using email + org name (e.g. `you@example.com (Acme Volunteers)`), so same-email accounts are always distinguishable with no user input required
+- **Auto-labelling**: Accounts are automatically labelled using email + org name (e.g. `you@example.com (Acme Volunteers)`). Personal accounts with an auto-generated org name are labelled `you@example.com (Personal)`. Same-email accounts are always distinguishable with no user input required
 - **OAuth and API support**: Manage both Claude official subscription accounts and custom API endpoints
 - **Automatic activation**: API environment variables are automatically activated in your current shell
 - **Persistent configuration**: Credentials persist across terminal sessions
@@ -119,7 +119,7 @@ export ANTHROPIC_AUTH_TOKEN='your-api-token'
 5. Switch between accounts with `./ccswitch.sh --switch-to "Acme Volunteers"` or `./ccswitch.sh --switch`
 6. **Important**: Restart Claude Code after switching to activate the new authentication
 
-> **Same-email accounts**: Accounts are tracked by their internal UUID, not email. Two accounts sharing an email are distinguished by org name — e.g. `you@example.com` (personal) and `you@example.com (Acme Volunteers)` (org account). You can switch by org name alone: `--switch-to "Acme Volunteers"`.
+> **Same-email accounts**: Accounts are tracked by a composite of their internal account UUID and org UUID, so two accounts sharing the same email are always treated as distinct. They are distinguished in labels by org name — e.g. `you@example.com (Personal)` and `you@example.com (Acme Volunteers)`. You can switch by the label suffix alone: `--switch-to "Acme Volunteers"` or `--switch-to Personal`.
 
 #### Migrating from an older version
 
@@ -226,6 +226,9 @@ When switching accounts:
 
 **`--remove-account` with a shared email address:**
 - If multiple accounts share the same email, specifying the email will abort with a list of matching accounts — use the account number or org name instead
+
+**Account numbers after removal:**
+- Remaining accounts are automatically resequenced to fill gaps (e.g. removing account 2 from [1, 2, 3] gives [1, 2]). Backup files and keychain entries are renamed accordingly.
 
 **Can't add account:**
 - Make sure you're logged into Claude Code first

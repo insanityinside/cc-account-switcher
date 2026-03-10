@@ -520,29 +520,26 @@ migrate_sequence_file() {
     echo "Migrating account data..."
 
     # For each account missing a label, derive label from backup config if available
-    local updated
-    updated="$SEQUENCE_FILE"
     while IFS= read -r account_num; do
-        local email org_name account_label backup_config
+        local email org_name org_uuid account_label backup_config
         email=$(jq -r --arg num "$account_num" '.accounts[$num].email' "$SEQUENCE_FILE")
         backup_config=$(read_account_config "$account_num" "$email")
 
         if [[ -n "$backup_config" ]]; then
             org_name=$(echo "$backup_config" | jq -r '.oauthAccount.organizationName // empty' 2>/dev/null)
+            org_uuid=$(echo "$backup_config" | jq -r '.oauthAccount.organizationUuid // empty' 2>/dev/null)
         else
             org_name=""
+            org_uuid=""
         fi
 
-        if [[ -n "$org_name" ]]; then
-            account_label="$email ($org_name)"
-        else
-            account_label="$email"
-        fi
+        account_label=$(derive_account_label "$email" "$org_name" "$org_uuid")
 
         local patched
-        patched=$(jq --arg num "$account_num" --arg label "$account_label" --arg orgName "$org_name" '
+        patched=$(jq --arg num "$account_num" --arg label "$account_label" --arg orgName "$org_name" --arg orgUuid "$org_uuid" '
             .accounts[$num].label = $label |
-            .accounts[$num].orgName = $orgName
+            .accounts[$num].orgName = $orgName |
+            .accounts[$num].orgUuid = $orgUuid
         ' "$SEQUENCE_FILE")
         write_json "$SEQUENCE_FILE" "$patched"
     done <<< "$needs_migration"
@@ -577,14 +574,34 @@ get_next_account_number() {
     echo $((max_num + 1))
 }
 
-# Check if account exists by UUID
+# Check if account exists by UUID + org UUID (composite key)
+# Personal and team accounts share accountUuid, so orgUuid is needed to distinguish them
 account_exists_by_uuid() {
-    local uuid="$1"
+    local account_uuid="$1"
+    local org_uuid="${2:-}"
     if [[ ! -f "$SEQUENCE_FILE" ]]; then
         return 1
     fi
 
-    jq -e --arg uuid "$uuid" '.accounts[] | select(.uuid == $uuid)' "$SEQUENCE_FILE" >/dev/null 2>&1
+    jq -e --arg uuid "$account_uuid" --arg ouuid "$org_uuid" \
+        '.accounts[] | select(.uuid == $uuid and (.orgUuid // "") == $ouuid)' \
+        "$SEQUENCE_FILE" >/dev/null 2>&1
+}
+
+# Derive a display label from email + org info
+# Uses "Team" when org name is the auto-generated "email's Organization" default
+derive_account_label() {
+    local email="$1"
+    local org_name="$2"
+    local org_uuid="$3"
+
+    if [[ -z "$org_uuid" ]]; then
+        echo "$email"
+    elif [[ -n "$org_name" && "$org_name" != *"$email"* ]]; then
+        echo "$email ($org_name)"
+    else
+        echo "$email (Personal)"
+    fi
 }
 
 # Get account type (oauth or api)
@@ -687,29 +704,24 @@ cmd_add_account() {
         exit 1
     fi
 
-    # Get account UUID (used as the true unique identifier)
-    local account_uuid
+    # Get account UUID and org UUID (composite unique identifier)
+    local account_uuid org_uuid org_name
     account_uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$(get_claude_config_path)")
+    org_uuid=$(jq -r '.oauthAccount.organizationUuid // empty' "$(get_claude_config_path)")
+    org_name=$(jq -r '.oauthAccount.organizationName // empty' "$(get_claude_config_path)")
 
     if [[ -z "$account_uuid" ]]; then
         echo "Error: Could not read accountUuid from Claude config"
         exit 1
     fi
 
-    if account_exists_by_uuid "$account_uuid"; then
-        echo "Account with UUID $account_uuid ($current_email) is already managed."
+    if account_exists_by_uuid "$account_uuid" "$org_uuid"; then
+        echo "Account ($current_email) is already managed."
         exit 0
     fi
 
-    # Auto-generate label from email + org name
-    local org_name
-    org_name=$(jq -r '.oauthAccount.organizationName // empty' "$(get_claude_config_path)")
     local account_label
-    if [[ -n "$org_name" ]]; then
-        account_label="$current_email ($org_name)"
-    else
-        account_label="$current_email"
-    fi
+    account_label=$(derive_account_label "$current_email" "$org_name" "$org_uuid")
 
     local account_num
     account_num=$(get_next_account_number)
@@ -730,10 +742,11 @@ cmd_add_account() {
 
     # Update sequence.json
     local updated_sequence
-    updated_sequence=$(jq --arg num "$account_num" --arg email "$current_email" --arg uuid "$account_uuid" --arg label "$account_label" --arg orgName "$org_name" --arg now "$(get_iso_timestamp)" '
+    updated_sequence=$(jq --arg num "$account_num" --arg email "$current_email" --arg uuid "$account_uuid" --arg orgUuid "$org_uuid" --arg label "$account_label" --arg orgName "$org_name" --arg now "$(get_iso_timestamp)" '
         .accounts[$num] = {
             email: $email,
             uuid: $uuid,
+            orgUuid: $orgUuid,
             label: $label,
             orgName: $orgName,
             type: "oauth",
@@ -747,6 +760,85 @@ cmd_add_account() {
     write_json "$SEQUENCE_FILE" "$updated_sequence"
 
     echo "Added Account $account_num: $account_label"
+}
+
+# Compact account numbers to be sequential after a deletion
+compact_sequence() {
+    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+        return 0
+    fi
+
+    local -a old_nums
+    mapfile -t old_nums < <(jq -r '.sequence[]' "$SEQUENCE_FILE")
+
+    # Check if already sequential (1, 2, 3, ...)
+    local needs_compact=0
+    for i in "${!old_nums[@]}"; do
+        if [[ "${old_nums[$i]}" != "$((i + 1))" ]]; then
+            needs_compact=1
+            break
+        fi
+    done
+    [[ "$needs_compact" -eq 0 ]] && return 0
+
+    local platform
+    platform=$(detect_platform)
+
+    # Build old->new mapping and rename backup files
+    # Processing in sequence order ensures new_num <= old_num (no filename conflicts)
+    local mapping='{}'
+    local new_num=0
+    for old_num in "${old_nums[@]}"; do
+        (( new_num++ ))
+        mapping=$(printf '%s' "$mapping" | jq --arg o "$old_num" --argjson n "$new_num" '. + {($o): $n}')
+
+        [[ "$old_num" == "$new_num" ]] && continue
+
+        local acct_type email
+        acct_type=$(jq -r --arg num "$old_num" '.accounts[$num].type // "oauth"' "$SEQUENCE_FILE")
+        email=$(jq -r --arg num "$old_num" '.accounts[$num].email' "$SEQUENCE_FILE")
+
+        if [[ "$acct_type" == "oauth" ]]; then
+            case "$platform" in
+                macos)
+                    local creds
+                    creds=$(security find-generic-password -s "Claude Code-Account-${old_num}-${email}" -w 2>/dev/null || true)
+                    if [[ -n "$creds" ]]; then
+                        security add-generic-password -U -s "Claude Code-Account-${new_num}-${email}" -a "$USER" -w "$creds" 2>/dev/null
+                        security delete-generic-password -s "Claude Code-Account-${old_num}-${email}" 2>/dev/null || true
+                    fi
+                    ;;
+                linux|wsl)
+                    local old_cred="$BACKUP_DIR/credentials/.claude-credentials-${old_num}-${email}.json"
+                    local new_cred="$BACKUP_DIR/credentials/.claude-credentials-${new_num}-${email}.json"
+                    [[ -f "$old_cred" ]] && mv "$old_cred" "$new_cred"
+                    ;;
+            esac
+            local old_cfg="$BACKUP_DIR/configs/.claude-config-${old_num}-${email}.json"
+            local new_cfg="$BACKUP_DIR/configs/.claude-config-${new_num}-${email}.json"
+            [[ -f "$old_cfg" ]] && mv "$old_cfg" "$new_cfg"
+        elif [[ "$acct_type" == "api" ]] && [[ -f "$API_ACCOUNTS_FILE" ]]; then
+            local updated_api
+            updated_api=$(jq --arg o "$old_num" --arg n "$new_num" '
+                if .accounts[$o] then .accounts[$n] = .accounts[$o] | del(.accounts[$o]) else . end
+            ' "$API_ACCOUNTS_FILE")
+            write_json "$API_ACCOUNTS_FILE" "$updated_api"
+        fi
+    done
+
+    # Rebuild sequence.json with remapped account numbers
+    local updated
+    updated=$(jq --argjson m "$mapping" --arg now "$(get_iso_timestamp)" '
+        .accounts as $a |
+        ($m | to_entries | reduce .[] as $e ({}; . + {($e.value | tostring): $a[$e.key]})) as $new_accts |
+        .accounts = $new_accts |
+        .sequence = [.sequence[] | ($m[tostring] // .)] |
+        .activeAccountNumber = (if .activeAccountNumber
+            then ($m[.activeAccountNumber | tostring] // .activeAccountNumber)
+            else null end) |
+        .lastUpdated = $now
+    ' "$SEQUENCE_FILE")
+    write_json "$SEQUENCE_FILE" "$updated"
 }
 
 # Remove account
@@ -857,7 +949,8 @@ cmd_remove_account() {
     ' "$SEQUENCE_FILE")
     
     write_json "$SEQUENCE_FILE" "$updated_sequence"
-    
+    compact_sequence
+
     echo "Account-$account_num ($email) has been removed"
 }
 
@@ -891,14 +984,15 @@ cmd_list() {
         exit 0
     fi
     
-    # Get current active account from .claude.json
-    local current_email
-    current_email=$(get_current_account)
-    
-    # Find which account number corresponds to the current email
+    # Identify active account by UUID+orgUuid (handles same-email accounts correctly)
     local active_account_num=""
-    if [[ "$current_email" != "none" ]]; then
-        active_account_num=$(jq -r --arg email "$current_email" '.accounts | to_entries[] | select(.value.email == $email) | .key' "$SEQUENCE_FILE" 2>/dev/null)
+    local cur_uuid cur_org_uuid
+    cur_uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$(get_claude_config_path)" 2>/dev/null)
+    cur_org_uuid=$(jq -r '.oauthAccount.organizationUuid // empty' "$(get_claude_config_path)" 2>/dev/null)
+    if [[ -n "$cur_uuid" ]]; then
+        active_account_num=$(jq -r --arg uuid "$cur_uuid" --arg ouuid "$cur_org_uuid" \
+            '.accounts | to_entries[] | select(.value.uuid == $uuid and (.value.orgUuid // "") == $ouuid) | .key' \
+            "$SEQUENCE_FILE" 2>/dev/null)
     fi
     
     echo "Accounts:"
@@ -949,9 +1043,11 @@ cmd_switch() {
         fi
 
         current_uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$(get_claude_config_path)" 2>/dev/null)
+        local current_org_uuid
+        current_org_uuid=$(jq -r '.oauthAccount.organizationUuid // empty' "$(get_claude_config_path)" 2>/dev/null)
 
-        # Check if current account is managed (by UUID)
-        if [[ -n "$current_uuid" ]] && ! account_exists_by_uuid "$current_uuid"; then
+        # Check if current account is managed (by UUID + orgUuid)
+        if [[ -n "$current_uuid" ]] && ! account_exists_by_uuid "$current_uuid" "$current_org_uuid"; then
             echo "Notice: Active account '$current_email' was not managed."
             cmd_add_account "oauth"
             local account_num
