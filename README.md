@@ -5,6 +5,8 @@ A simple command-line tool to manage and switch between multiple Claude Code acc
 ## Features
 
 - **One-command switching**: Single command to switch between OAuth and API accounts
+- **Same-email account support**: Manage multiple accounts that share the same email address (e.g. personal and work accounts on a single email)
+- **Auto-labelling**: Accounts are automatically labelled using email + org name (e.g. `you@example.com (Acme Volunteers)`), so same-email accounts are always distinguishable with no user input required
 - **OAuth and API support**: Manage both Claude official subscription accounts and custom API endpoints
 - **Automatic activation**: API environment variables are automatically activated in your current shell
 - **Persistent configuration**: Credentials persist across terminal sessions
@@ -71,7 +73,9 @@ The wrapper automatically activates API environment variables after switching, m
 With the shell wrapper installed:
 
 ```bash
-# Switch to a specific account by email or number
+# Switch by org name, full label, email, or number
+ccswitch --switch-to "Acme Volunteers"
+ccswitch --switch-to "you@example.com (Acme Volunteers)"
 ccswitch --switch-to user@example.com
 ccswitch --switch-to 2
 
@@ -82,7 +86,7 @@ ccswitch --switch
 ### Managing Accounts
 
 ```bash
-# Add current OAuth account
+# Add current OAuth account (label auto-generated from email + org name)
 ./ccswitch.sh --add-account
 
 # Add API account (set environment variables first)
@@ -93,7 +97,11 @@ export ANTHROPIC_AUTH_TOKEN='your-api-token'
 # List all accounts
 ./ccswitch.sh --list
 
-# Remove an account
+# Rename an account's label (optional — auto-generated labels are usually sufficient)
+./ccswitch.sh --rename-account 1 "My Personal Account"
+
+# Remove an account (by org name, label, email, or number)
+./ccswitch.sh --remove-account "Acme Volunteers"
 ./ccswitch.sh --remove-account user@example.com
 
 # Show help
@@ -105,11 +113,17 @@ export ANTHROPIC_AUTH_TOKEN='your-api-token'
 #### OAuth Accounts (Claude Official Subscription)
 
 1. Log into Claude Code with your first account
-2. Run `./ccswitch.sh --add-account` to save it
+2. Run `./ccswitch.sh --add-account` — the label is auto-generated from your email and org name
 3. Log out and log into Claude Code with your second account
 4. Run `./ccswitch.sh --add-account` again
-5. Switch between accounts with `./ccswitch.sh --switch`
+5. Switch between accounts with `./ccswitch.sh --switch-to "Acme Volunteers"` or `./ccswitch.sh --switch`
 6. **Important**: Restart Claude Code after switching to activate the new authentication
+
+> **Same-email accounts**: Accounts are tracked by their internal UUID, not email. Two accounts sharing an email are distinguished by org name — e.g. `you@example.com` (personal) and `you@example.com (Acme Volunteers)` (org account). You can switch by org name alone: `--switch-to "Acme Volunteers"`.
+
+#### Migrating from an older version
+
+If you already have accounts saved without labels, the tool automatically migrates them on first run — reading the org name from each account's stored backup to generate the correct label. Use `--list` to verify, and `--rename-account` to adjust if needed.
 
 #### API Accounts (Custom Endpoints)
 
@@ -119,7 +133,7 @@ export ANTHROPIC_AUTH_TOKEN='your-api-token'
    export ANTHROPIC_AUTH_TOKEN='your-api-token'
    ```
 2. Run `./ccswitch.sh --add-api-account "My API Name"`
-3. Switch to the account: `./ccswitch.sh --switch-to <account_number>`
+3. Switch to the account: `./ccswitch.sh --switch-to "My API Name"` (or by number)
 4. The environment variables are automatically added to your shell profile for persistence
 
 > **Note**: Only authentication credentials change when switching. Your themes, settings, preferences, and chat history remain unchanged.
@@ -209,6 +223,9 @@ When switching accounts:
 - Check accounts exist: `./ccswitch.sh --list`
 - Ensure Claude Code is closed before switching
 - Try switching back to your original account
+
+**`--remove-account` with a shared email address:**
+- If multiple accounts share the same email, specifying the email will abort with a list of matching accounts — use the account number or org name instead
 
 **Can't add account:**
 - Make sure you're logged into Claude Code first

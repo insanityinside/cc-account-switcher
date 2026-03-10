@@ -120,9 +120,15 @@ resolve_account_identifier() {
             echo ""
         fi
     else
-        # Look up account number by label (case-insensitive)
+        # Try org name match first (case-insensitive), then full label
         local account_num
-        account_num=$(jq -r --arg label "$identifier" '.accounts | to_entries[] | select((.value.label // "") | ascii_downcase == ($label | ascii_downcase)) | .key' "$SEQUENCE_FILE" 2>/dev/null | head -1)
+        account_num=$(jq -r --arg id "$identifier" '
+            .accounts | to_entries[] |
+            select(
+                ((.value.orgName // "") | ascii_downcase == ($id | ascii_downcase)) or
+                ((.value.label // "") | ascii_downcase == ($id | ascii_downcase))
+            ) | .key
+        ' "$SEQUENCE_FILE" 2>/dev/null | head -1)
         if [[ -n "$account_num" && "$account_num" != "null" ]]; then
             echo "$account_num"
         else
@@ -497,7 +503,7 @@ init_sequence_file() {
     fi
 }
 
-# Migrate sequence.json from older versions that lack the label field
+# Migrate sequence.json from older versions that lack the label/orgName fields
 migrate_sequence_file() {
     if [[ ! -f "$SEQUENCE_FILE" ]]; then
         return 0
@@ -511,23 +517,41 @@ migrate_sequence_file() {
         return 0
     fi
 
-    echo "Migrating account data to support labels..."
+    echo "Migrating account data..."
 
-    # Assign default label "Account N" to any account missing one
-    local migrated
-    migrated=$(jq --arg now "$(get_iso_timestamp)" '
-        .accounts |= with_entries(
-            if .value.label == null then
-                .value.label = "Account \(.key)"
-            else
-                .
-            end
-        ) |
-        .lastUpdated = $now
-    ' "$SEQUENCE_FILE")
+    # For each account missing a label, derive label from backup config if available
+    local updated
+    updated="$SEQUENCE_FILE"
+    while IFS= read -r account_num; do
+        local email org_name account_label backup_config
+        email=$(jq -r --arg num "$account_num" '.accounts[$num].email' "$SEQUENCE_FILE")
+        backup_config=$(read_account_config "$account_num" "$email")
 
-    write_json "$SEQUENCE_FILE" "$migrated"
-    echo "Migration complete. Run --list to review accounts and rename labels with --rename-account if needed."
+        if [[ -n "$backup_config" ]]; then
+            org_name=$(echo "$backup_config" | jq -r '.oauthAccount.organizationName // empty' 2>/dev/null)
+        else
+            org_name=""
+        fi
+
+        if [[ -n "$org_name" ]]; then
+            account_label="$email ($org_name)"
+        else
+            account_label="$email"
+        fi
+
+        local patched
+        patched=$(jq --arg num "$account_num" --arg label "$account_label" --arg orgName "$org_name" '
+            .accounts[$num].label = $label |
+            .accounts[$num].orgName = $orgName
+        ' "$SEQUENCE_FILE")
+        write_json "$SEQUENCE_FILE" "$patched"
+    done <<< "$needs_migration"
+
+    local final
+    final=$(jq --arg now "$(get_iso_timestamp)" '.lastUpdated = $now' "$SEQUENCE_FILE")
+    write_json "$SEQUENCE_FILE" "$final"
+
+    echo "Migration complete. Run --list to review. Use --rename-account to adjust labels if needed."
 }
 
 # Initialize api_accounts.json if it doesn't exist
@@ -561,16 +585,6 @@ account_exists_by_uuid() {
     fi
 
     jq -e --arg uuid "$uuid" '.accounts[] | select(.uuid == $uuid)' "$SEQUENCE_FILE" >/dev/null 2>&1
-}
-
-# Check if account exists by email (kept for backward compat, matches first)
-account_exists() {
-    local email="$1"
-    if [[ ! -f "$SEQUENCE_FILE" ]]; then
-        return 1
-    fi
-
-    jq -e --arg email "$email" '.accounts[] | select(.email == $email)' "$SEQUENCE_FILE" >/dev/null 2>&1
 }
 
 # Get account type (oauth or api)
@@ -636,15 +650,16 @@ add_api_account_from_env() {
         .accounts[$num] = {
             email: $name,
             uuid: $uuid,
+            label: $name,
             type: "api",
             added: $now
         } |
         .sequence += [$num | tonumber] |
         .lastUpdated = $now
     ' "$SEQUENCE_FILE")
-    
+
     write_json "$SEQUENCE_FILE" "$updated_sequence"
-    
+
     echo "Added API Account $account_num: $account_name"
     echo "  Base URL: $base_url"
 }
@@ -686,11 +701,15 @@ cmd_add_account() {
         exit 0
     fi
 
-    # Prompt for a label to identify this account
-    echo "Adding account: $current_email"
-    echo -n "Enter a label for this account (e.g. 'Personal', 'Volunteer'): "
-    read -r account_label
-    account_label="${account_label:-Account $(get_next_account_number)}"
+    # Auto-generate label from email + org name
+    local org_name
+    org_name=$(jq -r '.oauthAccount.organizationName // empty' "$(get_claude_config_path)")
+    local account_label
+    if [[ -n "$org_name" ]]; then
+        account_label="$current_email ($org_name)"
+    else
+        account_label="$current_email"
+    fi
 
     local account_num
     account_num=$(get_next_account_number)
@@ -711,11 +730,12 @@ cmd_add_account() {
 
     # Update sequence.json
     local updated_sequence
-    updated_sequence=$(jq --arg num "$account_num" --arg email "$current_email" --arg uuid "$account_uuid" --arg label "$account_label" --arg now "$(get_iso_timestamp)" '
+    updated_sequence=$(jq --arg num "$account_num" --arg email "$current_email" --arg uuid "$account_uuid" --arg label "$account_label" --arg orgName "$org_name" --arg now "$(get_iso_timestamp)" '
         .accounts[$num] = {
             email: $email,
             uuid: $uuid,
             label: $label,
+            orgName: $orgName,
             type: "oauth",
             added: $now
         } |
@@ -726,7 +746,7 @@ cmd_add_account() {
 
     write_json "$SEQUENCE_FILE" "$updated_sequence"
 
-    echo "Added Account $account_num: $account_label ($current_email)"
+    echo "Added Account $account_num: $account_label"
 }
 
 # Remove account
@@ -747,18 +767,37 @@ cmd_remove_account() {
     # Handle number, email, or label
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then
         account_num="$identifier"
+    elif validate_email "$identifier"; then
+        # Check for multiple accounts with the same email — abort with list
+        local matches
+        matches=$(jq -r --arg email "$identifier" '.accounts | to_entries[] | select(.value.email == $email) | .key' "$SEQUENCE_FILE" 2>/dev/null)
+        local match_count
+        match_count=$(echo "$matches" | grep -c .)
+        if [[ "$match_count" -gt 1 ]]; then
+            echo "Error: Multiple accounts share the email '$identifier'. Please specify by label or number:"
+            jq -r --arg email "$identifier" '
+                .accounts | to_entries[] | select(.value.email == $email) |
+                "  \(.key): \(.value.label // .value.email)"
+            ' "$SEQUENCE_FILE"
+            exit 1
+        fi
+        account_num=$(echo "$matches" | head -1)
+        if [[ -z "$account_num" ]]; then
+            echo "Error: No account found matching: $identifier"
+            exit 1
+        fi
     else
-        # resolve_account_identifier handles both email and label lookup
+        # resolve_account_identifier handles label lookup
         account_num=$(resolve_account_identifier "$identifier")
         if [[ -z "$account_num" ]]; then
             echo "Error: No account found matching: $identifier"
             exit 1
         fi
     fi
-    
+
     local account_info
     account_info=$(jq -r --arg num "$account_num" '.accounts[$num] // empty' "$SEQUENCE_FILE")
-    
+
     if [[ -z "$account_info" ]]; then
         echo "Error: Account-$account_num does not exist"
         exit 1
@@ -866,7 +905,7 @@ cmd_list() {
     jq -r --arg active "$active_account_num" '
         .sequence[] as $num |
         .accounts["\($num)"] |
-        (if .label then "\(.label) (\(.email))" else .email end) as $display |
+        (.label // .email) as $display |
         if "\($num)" == $active then
             "  \($num): \($display) [\(.type // "oauth")] (active)"
         else
@@ -1222,10 +1261,10 @@ show_usage() {
     echo "  $0 --switch"
     echo "  $0 --switch-to 2"
     echo "  $0 --switch-to user@example.com"
-    echo "  $0 --switch-to Personal"
-    echo "  $0 --remove-account Personal"
+    echo "  $0 --switch-to \"Acme Volunteers\""
+    echo "  $0 --remove-account \"Acme Volunteers\""
     echo "  $0 --remove-account user@example.com"
-    echo "  $0 --rename-account 1 Personal"
+    echo "  $0 --rename-account 1 \"My Personal Account\""
     echo ""
     echo "Recommended Setup - Add wrapper function to shell profile for one-command switching:"
     echo "  # Add to ~/.zshrc or ~/.bashrc"
