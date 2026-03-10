@@ -758,8 +758,11 @@ cmd_add_account() {
     ' "$SEQUENCE_FILE")
 
     write_json "$SEQUENCE_FILE" "$updated_sequence"
+    compact_sequence
 
-    echo "Added Account $account_num: $account_label"
+    local final_num
+    final_num=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
+    echo "Added Account $final_num: $account_label"
 }
 
 # Compact account numbers to be sequential after a deletion
