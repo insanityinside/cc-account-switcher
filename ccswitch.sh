@@ -110,10 +110,19 @@ resolve_account_identifier() {
     local identifier="$1"
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then
         echo "$identifier"  # It's a number
-    else
-        # Look up account number by email
+    elif validate_email "$identifier"; then
+        # Look up account number by email (first match)
         local account_num
-        account_num=$(jq -r --arg email "$identifier" '.accounts | to_entries[] | select(.value.email == $email) | .key' "$SEQUENCE_FILE" 2>/dev/null)
+        account_num=$(jq -r --arg email "$identifier" '.accounts | to_entries[] | select(.value.email == $email) | .key' "$SEQUENCE_FILE" 2>/dev/null | head -1)
+        if [[ -n "$account_num" && "$account_num" != "null" ]]; then
+            echo "$account_num"
+        else
+            echo ""
+        fi
+    else
+        # Look up account number by label (case-insensitive)
+        local account_num
+        account_num=$(jq -r --arg label "$identifier" '.accounts | to_entries[] | select((.value.label // "") | ascii_downcase == ($label | ascii_downcase)) | .key' "$SEQUENCE_FILE" 2>/dev/null | head -1)
         if [[ -n "$account_num" && "$account_num" != "null" ]]; then
             echo "$account_num"
         else
@@ -488,6 +497,39 @@ init_sequence_file() {
     fi
 }
 
+# Migrate sequence.json from older versions that lack the label field
+migrate_sequence_file() {
+    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+        return 0
+    fi
+
+    # Check if any account is missing a label field
+    local needs_migration
+    needs_migration=$(jq -r '.accounts | to_entries[] | select(.value.label == null) | .key' "$SEQUENCE_FILE" 2>/dev/null)
+
+    if [[ -z "$needs_migration" ]]; then
+        return 0
+    fi
+
+    echo "Migrating account data to support labels..."
+
+    # Assign default label "Account N" to any account missing one
+    local migrated
+    migrated=$(jq --arg now "$(get_iso_timestamp)" '
+        .accounts |= with_entries(
+            if .value.label == null then
+                .value.label = "Account \(.key)"
+            else
+                .
+            end
+        ) |
+        .lastUpdated = $now
+    ' "$SEQUENCE_FILE")
+
+    write_json "$SEQUENCE_FILE" "$migrated"
+    echo "Migration complete. Run --list to review accounts and rename labels with --rename-account if needed."
+}
+
 # Initialize api_accounts.json if it doesn't exist
 init_api_accounts_file() {
     if [[ ! -f "$API_ACCOUNTS_FILE" ]]; then
@@ -511,13 +553,23 @@ get_next_account_number() {
     echo $((max_num + 1))
 }
 
-# Check if account exists by email
+# Check if account exists by UUID
+account_exists_by_uuid() {
+    local uuid="$1"
+    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+        return 1
+    fi
+
+    jq -e --arg uuid "$uuid" '.accounts[] | select(.uuid == $uuid)' "$SEQUENCE_FILE" >/dev/null 2>&1
+}
+
+# Check if account exists by email (kept for backward compat, matches first)
 account_exists() {
     local email="$1"
     if [[ ! -f "$SEQUENCE_FILE" ]]; then
         return 1
     fi
-    
+
     jq -e --arg email "$email" '.accounts[] | select(.email == $email)' "$SEQUENCE_FILE" >/dev/null 2>&1
 }
 
@@ -611,47 +663,59 @@ cmd_add_account() {
     # Handle OAuth account
     setup_directories
     init_sequence_file
-    
+
     local current_email
     current_email=$(get_current_account)
-    
+
     if [[ "$current_email" == "none" ]]; then
         echo "Error: No active Claude account found. Please log in first."
         exit 1
     fi
-    
-    if account_exists "$current_email"; then
-        echo "Account $current_email is already managed."
+
+    # Get account UUID (used as the true unique identifier)
+    local account_uuid
+    account_uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$(get_claude_config_path)")
+
+    if [[ -z "$account_uuid" ]]; then
+        echo "Error: Could not read accountUuid from Claude config"
+        exit 1
+    fi
+
+    if account_exists_by_uuid "$account_uuid"; then
+        echo "Account with UUID $account_uuid ($current_email) is already managed."
         exit 0
     fi
-    
+
+    # Prompt for a label to identify this account
+    echo "Adding account: $current_email"
+    echo -n "Enter a label for this account (e.g. 'Personal', 'Volunteer'): "
+    read -r account_label
+    account_label="${account_label:-Account $(get_next_account_number)}"
+
     local account_num
     account_num=$(get_next_account_number)
-    
+
     # Backup current credentials and config
     local current_creds current_config
     current_creds=$(read_credentials)
     current_config=$(cat "$(get_claude_config_path)")
-    
+
     if [[ -z "$current_creds" ]]; then
         echo "Error: No credentials found for current account"
         exit 1
     fi
-    
-    # Get account UUID
-    local account_uuid
-    account_uuid=$(jq -r '.oauthAccount.accountUuid' "$(get_claude_config_path)")
-    
+
     # Store backups
     write_account_credentials "$account_num" "$current_email" "$current_creds"
     write_account_config "$account_num" "$current_email" "$current_config"
-    
+
     # Update sequence.json
     local updated_sequence
-    updated_sequence=$(jq --arg num "$account_num" --arg email "$current_email" --arg uuid "$account_uuid" --arg now "$(get_iso_timestamp)" '
+    updated_sequence=$(jq --arg num "$account_num" --arg email "$current_email" --arg uuid "$account_uuid" --arg label "$account_label" --arg now "$(get_iso_timestamp)" '
         .accounts[$num] = {
             email: $email,
             uuid: $uuid,
+            label: $label,
             type: "oauth",
             added: $now
         } |
@@ -659,10 +723,10 @@ cmd_add_account() {
         .activeAccountNumber = ($num | tonumber) |
         .lastUpdated = $now
     ' "$SEQUENCE_FILE")
-    
+
     write_json "$SEQUENCE_FILE" "$updated_sequence"
-    
-    echo "Added Account $account_num: $current_email"
+
+    echo "Added Account $account_num: $account_label ($current_email)"
 }
 
 # Remove account
@@ -680,20 +744,14 @@ cmd_remove_account() {
         exit 1
     fi
     
-    # Handle email vs numeric identifier
+    # Handle number, email, or label
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then
         account_num="$identifier"
     else
-        # Validate email format
-        if ! validate_email "$identifier"; then
-            echo "Error: Invalid email format: $identifier"
-            exit 1
-        fi
-        
-        # Resolve email to account number
+        # resolve_account_identifier handles both email and label lookup
         account_num=$(resolve_account_identifier "$identifier")
         if [[ -z "$account_num" ]]; then
-            echo "Error: No account found with email: $identifier"
+            echo "Error: No account found matching: $identifier"
             exit 1
         fi
     fi
@@ -808,10 +866,11 @@ cmd_list() {
     jq -r --arg active "$active_account_num" '
         .sequence[] as $num |
         .accounts["\($num)"] |
+        (if .label then "\(.label) (\(.email))" else .email end) as $display |
         if "\($num)" == $active then
-            "  \($num): \(.email) [\(.type // "oauth")] (active)"
+            "  \($num): \($display) [\(.type // "oauth")] (active)"
         else
-            "  \($num): \(.email) [\(.type // "oauth")]"
+            "  \($num): \($display) [\(.type // "oauth")]"
         end
     ' "$SEQUENCE_FILE"
 }
@@ -842,16 +901,18 @@ cmd_switch() {
     active_type=$(get_account_type "$active_account")
     
     if [[ "$active_type" == "oauth" ]]; then
-        local current_email
+        local current_email current_uuid
         current_email=$(get_current_account)
-        
+
         if [[ "$current_email" == "none" ]]; then
             echo "Error: No active Claude account found"
             exit 1
         fi
-        
-        # Check if current account is managed
-        if ! account_exists "$current_email"; then
+
+        current_uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$(get_claude_config_path)" 2>/dev/null)
+
+        # Check if current account is managed (by UUID)
+        if [[ -n "$current_uuid" ]] && ! account_exists_by_uuid "$current_uuid"; then
             echo "Notice: Active account '$current_email' was not managed."
             cmd_add_account "oauth"
             local account_num
@@ -891,32 +952,26 @@ cmd_switch_to() {
         exit 1
     fi
     
-    # Handle email vs numeric identifier
+    # Handle number, email, or label
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then
         target_account="$identifier"
     else
-        # Validate email format
-        if ! validate_email "$identifier"; then
-            echo "Error: Invalid email format: $identifier"
-            exit 1
-        fi
-        
-        # Resolve email to account number
+        # resolve_account_identifier handles both email and label lookup
         target_account=$(resolve_account_identifier "$identifier")
         if [[ -z "$target_account" ]]; then
-            echo "Error: No account found with email: $identifier"
+            echo "Error: No account found matching: $identifier"
             exit 1
         fi
     fi
-    
+
     local account_info
     account_info=$(jq -r --arg num "$target_account" '.accounts[$num] // empty' "$SEQUENCE_FILE")
-    
+
     if [[ -z "$account_info" ]]; then
         echo "Error: Account-$target_account does not exist"
         exit 1
     fi
-    
+
     perform_switch "$target_account"
 }
 
@@ -1089,6 +1144,54 @@ cmd_env_setup() {
     grep "^export" "$env_file" 2>/dev/null || true
 }
 
+# Rename account label
+cmd_rename_account() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: $0 --rename-account <num|email|label> <new-label>"
+        exit 1
+    fi
+
+    local identifier="$1"
+    local new_label="$2"
+
+    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+        echo "Error: No accounts are managed yet"
+        exit 1
+    fi
+
+    local account_num
+    if [[ "$identifier" =~ ^[0-9]+$ ]]; then
+        account_num="$identifier"
+    else
+        account_num=$(resolve_account_identifier "$identifier")
+        if [[ -z "$account_num" ]]; then
+            echo "Error: No account found matching: $identifier"
+            exit 1
+        fi
+    fi
+
+    local account_info
+    account_info=$(jq -r --arg num "$account_num" '.accounts[$num] // empty' "$SEQUENCE_FILE")
+
+    if [[ -z "$account_info" ]]; then
+        echo "Error: Account-$account_num does not exist"
+        exit 1
+    fi
+
+    local old_label email
+    old_label=$(echo "$account_info" | jq -r '.label // .email')
+    email=$(echo "$account_info" | jq -r '.email')
+
+    local updated_sequence
+    updated_sequence=$(jq --arg num "$account_num" --arg label "$new_label" --arg now "$(get_iso_timestamp)" '
+        .accounts[$num].label = $label |
+        .lastUpdated = $now
+    ' "$SEQUENCE_FILE")
+
+    write_json "$SEQUENCE_FILE" "$updated_sequence"
+    echo "Renamed Account-$account_num: '$old_label' -> '$new_label' ($email)"
+}
+
 # Show usage
 show_usage() {
     echo "Multi-Account Switcher for Claude Code"
@@ -1097,10 +1200,11 @@ show_usage() {
     echo "Commands:"
     echo "  --add-account                    Add current OAuth account to managed accounts"
     echo "  --add-api-account [name]        Add API account from ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN"
-    echo "  --remove-account <num|email>    Remove account by number or email"
+    echo "  --remove-account <num|email|label>   Remove account by number, email, or label"
+  echo "  --rename-account <num|email|label> <new-label>  Rename an account's label"
     echo "  --list                           List all managed accounts"
     echo "  --switch                         Rotate to next account in sequence"
-    echo "  --switch-to <num|email>          Switch to specific account number or email"
+    echo "  --switch-to <num|email|label>    Switch to specific account by number, email, or label"
     echo "  --env-setup                      Output environment setup commands (use with eval)"
     echo "  --help                           Show this help message"
     echo ""
@@ -1118,7 +1222,10 @@ show_usage() {
     echo "  $0 --switch"
     echo "  $0 --switch-to 2"
     echo "  $0 --switch-to user@example.com"
+    echo "  $0 --switch-to Personal"
+    echo "  $0 --remove-account Personal"
     echo "  $0 --remove-account user@example.com"
+    echo "  $0 --rename-account 1 Personal"
     echo ""
     echo "Recommended Setup - Add wrapper function to shell profile for one-command switching:"
     echo "  # Add to ~/.zshrc or ~/.bashrc"
@@ -1139,7 +1246,8 @@ main() {
     
     check_bash_version
     check_dependencies
-    
+    migrate_sequence_file
+
     case "${1:-}" in
         --add-account)
             cmd_add_account "oauth"
@@ -1161,6 +1269,10 @@ main() {
         --switch-to)
             shift
             cmd_switch_to "$@"
+            ;;
+        --rename-account)
+            shift
+            cmd_rename_account "$@"
             ;;
         --env-setup)
             cmd_env_setup
